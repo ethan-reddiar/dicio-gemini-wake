@@ -371,13 +371,15 @@ class WakeService : Service() {
      * assistant activity even when the app is in the background on Android 10+.
      */
     private fun postAssistantFullScreenNotification(assistantIntent: Intent) {
-        val channel = NotificationChannel(
-            TRIGGERED_NOTIFICATION_CHANNEL_ID,
-            getString(R.string.wake_service_triggered_notification),
-            NotificationManager.IMPORTANCE_HIGH
-        )
-        channel.description = getString(R.string.wake_service_triggered_notification_summary)
-        notificationManager.createNotificationChannel(channel)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                TRIGGERED_NOTIFICATION_CHANNEL_ID,
+                getString(R.string.wake_service_triggered_notification),
+                NotificationManager.IMPORTANCE_HIGH
+            )
+            channel.description = getString(R.string.wake_service_triggered_notification_summary)
+            notificationManager.createNotificationChannel(channel)
+        }
 
         val pendingIntent = PendingIntent.getActivity(
             this,
