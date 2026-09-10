@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+import android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
 import android.content.pm.PackageManager.PERMISSION_GRANTED
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -197,10 +198,24 @@ class WakeService : Service() {
 
         var audio = ShortArray(0)
         var nextWakeWordAllowed = Instant.MIN
+        var resumeListeningAt = Instant.MIN
 
         try {
             ar.startRecording()
             while (listening.get()) {
+                // gemini-wake patch: while the launched assistant (Gemini) is using the
+                // microphone, release the mic and wait, otherwise Gemini would hear nothing.
+                if (Instant.now() < resumeListeningAt) {
+                    if (ar.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        ar.stop()
+                    }
+                    Thread.sleep(ASSISTANT_SESSION_POLL_MILLIS)
+                    continue
+                } else if (ar.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    @SuppressLint("MissingPermission")
+                    ar.startRecording()
+                }
+
                 if (audio.size != wakeDevice.frameSize()) {
                     audio = ShortArray(wakeDevice.frameSize())
                 }
@@ -210,7 +225,11 @@ class WakeService : Service() {
                 val wakeWordDetected = wakeDevice.processFrame(audio)
                 if (wakeWordDetected && Instant.now() > nextWakeWordAllowed) {
                     nextWakeWordAllowed = Instant.now().plusMillis(WAKE_WORD_BACKOFF_MILLIS)
-                    onWakeWordDetected()
+                    val assistantLaunched = onWakeWordDetected()
+                    if (assistantLaunched) {
+                        // free the microphone for the assistant for a while
+                        resumeListeningAt = Instant.now().plusMillis(ASSISTANT_SESSION_MILLIS)
+                    }
                 }
 
                 lastHeard.set(Instant.now())
@@ -221,9 +240,43 @@ class WakeService : Service() {
         }
     }
 
-    private fun onWakeWordDetected() {
+    /**
+     * gemini-wake patch: on wake word, first try to launch the default assistant (Gemini) in
+     * voice mode, falling back to the Gemini app and then the Google app.
+     *
+     * @return true if an assistant was launched — in that case Dicio's own speech-to-text popup
+     *         is NOT started, and the caller should pause wake word listening for a while to
+     *         free the microphone for the assistant; false if Dicio should handle the wake word
+     *         itself (original behavior).
+     */
+    private fun onWakeWordDetected(): Boolean {
         Log.d(TAG, "Wake word detected")
 
+        val assistantIntent = buildAssistantIntent()
+        if (assistantIntent != null) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || MainActivity.isInForeground > 0) {
+                try {
+                    startActivity(assistantIntent)
+                    return true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not start assistant activity directly", t)
+                }
+            } else {
+                // Android 10+ does not allow starting activities from the background,
+                // so show a full-screen notification instead, which does actually result in
+                // starting the activity from the background if the phone is off and
+                // Do Not Disturb is not active.
+                postAssistantFullScreenNotification(assistantIntent)
+                // cancel the notification after a while in case the user ignored it
+                handler.postDelayed(
+                    { notificationManager.cancel(TRIGGERED_NOTIFICATION_ID) },
+                    ASSISTANT_NOTIFICATION_TIMEOUT_MILLIS,
+                )
+                return true
+            }
+        }
+
+        // Original behavior: no assistant app found, let Dicio handle the wake word itself.
         val intent = Intent(this, MainActivity::class.java)
         intent.setAction(ACTION_WAKE_WORD)
         intent.setFlags(FLAG_ACTIVITY_NEW_TASK)
@@ -274,6 +327,76 @@ class WakeService : Service() {
             notificationManager.cancel(TRIGGERED_NOTIFICATION_ID)
             notificationManager.notify(TRIGGERED_NOTIFICATION_ID, notification)
         }
+
+        return false
+    }
+
+    /**
+     * gemini-wake patch: build an intent that opens the assistant in voice mode.
+     *
+     * Prefers [Intent.ACTION_VOICE_COMMAND], which opens whichever app is set as the default
+     * digital assistant (ideally Gemini) straight into listening mode. Falls back to the
+     * launcher intent of the Gemini app, then of the Google app.
+     *
+     * @return the intent to launch, or null if no assistant-like app is installed
+     */
+    private fun buildAssistantIntent(): Intent? {
+        try {
+            val voice = Intent(Intent.ACTION_VOICE_COMMAND)
+                .setFlags(FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            if (voice.resolveActivity(packageManager) != null) {
+                return voice
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "ACTION_VOICE_COMMAND not available", t)
+        }
+
+        for (pkg in ASSISTANT_PACKAGES) {
+            try {
+                val launch = packageManager.getLaunchIntentForPackage(pkg)
+                if (launch != null) {
+                    return launch.addFlags(
+                        FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Could not build launch intent for $pkg", t)
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * gemini-wake patch: show a high-priority full-screen notification that surfaces the
+     * assistant activity even when the app is in the background on Android 10+.
+     */
+    private fun postAssistantFullScreenNotification(assistantIntent: Intent) {
+        val channel = NotificationChannel(
+            TRIGGERED_NOTIFICATION_CHANNEL_ID,
+            getString(R.string.wake_service_triggered_notification),
+            NotificationManager.IMPORTANCE_HIGH
+        )
+        channel.description = getString(R.string.wake_service_triggered_notification_summary)
+        notificationManager.createNotificationChannel(channel)
+
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            1,
+            assistantIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val notification = NotificationCompat.Builder(this, TRIGGERED_NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_hearing_white)
+            .setContentTitle(getString(R.string.wake_service_triggered_notification))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(
+                getString(R.string.wake_service_triggered_notification_summary)))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setFullScreenIntent(pendingIntent, true)
+            .build()
+
+        notificationManager.cancel(TRIGGERED_NOTIFICATION_ID)
+        notificationManager.notify(TRIGGERED_NOTIFICATION_ID, notification)
     }
 
     companion object {
@@ -364,6 +487,19 @@ class WakeService : Service() {
         private const val START_NOTIFICATION_ID = 48019274
         private const val TRIGGERED_NOTIFICATION_ID = 601398647
         private const val WAKE_WORD_BACKOFF_MILLIS = 4000L
+
+        // gemini-wake patch constants
+        /** How long wake word listening pauses after launching the assistant, to free the mic. */
+        private const val ASSISTANT_SESSION_MILLIS = 45_000L
+        /** Poll interval while wake word listening is paused for an assistant session. */
+        private const val ASSISTANT_SESSION_POLL_MILLIS = 250L
+        /** Auto-cancel the assistant full-screen notification after this delay. */
+        private const val ASSISTANT_NOTIFICATION_TIMEOUT_MILLIS = 30_000L
+        /** Packages tried as assistant fallback, in order: Gemini app, then Google app. */
+        private val ASSISTANT_PACKAGES = listOf(
+            "com.google.android.apps.bard",
+            "com.google.android.googlequicksearchbox",
+        )
         private const val ACTION_STOP_WAKE_SERVICE =
             "org.stypox.dicio.io.wake.WakeService.ACTION_STOP"
         private const val RELEASE_STT_RESOURCES_MILLIS = 1000L * 60 * 5 // 5 minutes

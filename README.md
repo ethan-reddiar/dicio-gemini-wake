@@ -69,3 +69,23 @@ If you want to translate Dicio to a new language, follow the **steps** listed in
 ### Adding skills
 
 If you want to add a new skill, or improve an existing one, check out the guide in the documentation: https://dicio.stypox.org/adding_skill.html
+
+---
+
+# gemini-wake fork
+
+This fork changes one thing: when the wake word is detected, instead of opening Dicio's own
+speech popup, the app launches your **default assistant (Gemini)** in voice mode
+(`ACTION_VOICE_COMMAND`, falling back to the Gemini app, then the Google app).
+Wake-word listening pauses for 45 s so Gemini can use the microphone, then resumes.
+If no assistant app is installed, Dicio behaves exactly as upstream.
+
+Wake word is **OpenWakeWord** — fully on-device, no account or API key needed.
+Default phrase: "Hey Dicio". To use "Hey Google" or any custom phrase, train a `.tflite`
+model with the free [openWakeWord training notebook](https://colab.research.google.com/github/dscripka/openWakeWord/blob/main/notebooks/automatic_model_training.ipynb)
+(~1 h, needs a Google account) or download a pre-trained one (e.g. `hey_jarvis` from the
+[openWakeWord releases](https://github.com/dscripka/openWakeWord/releases)), then in Dicio:
+`Settings → Input and output methods → Import custom wake word`.
+
+Build: push to `main` runs the upstream CI workflow which builds the debug APK and uploads it
+as the `app` artifact of the workflow run (Actions tab).
